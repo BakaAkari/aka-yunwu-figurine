@@ -1,0 +1,22 @@
+{
+  "name": "koishi-plugin-aka-yunwu-figurine",
+  "description": "自用-调用yunwu接口的手办化生成图",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "license": "MIT",
+  "scripts": {},
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin"
+  ],
+  "devDependencies": {},
+  "peerDependencies": {
+    "koishi": "^4.18.9"
+  }
+}
