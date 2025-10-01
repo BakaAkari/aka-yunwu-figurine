@@ -23,10 +23,11 @@ export function apply(ctx: Context, config: any) {
   // 获取风格提示词（硬编码，不依赖配置）
   function getStylePrompt(style: string): string {
     const stylePrompts: Record<string, string> = {
-      // 3个核心风格
+      // 4个核心风格
       figurine: '将这张照片变成手办模型。在它后面放置一个印有图像主体的盒子，桌子上有一台电脑显示Blender建模过程。在盒子前面添加一个圆形塑料底座，角色手办站在上面。如果可能的话，将场景设置在室内',
-      realistic: '生成一个女孩cosplay这张插画的照片，背景设置在Comiket',
-      character_design: '为我生成人物的角色设定（Character Design）, 比例设定（不同身高对比、头身比等）, 三视图（正面、侧面、背面）, 表情设定（Expression Sheet） , 动作设定（Pose Sheet） → 各种常见姿势, 服装设定（Costume Design）'
+      realistic: '生成一个真人女孩cosplay这张插画的写实照片，照片背景设置在普通街道',
+      character_design: '为我生成人物的角色设定（Character Design）, 比例设定（不同身高对比、头身比等）, 三视图（正面、侧面、背面）, 表情设定（Expression Sheet） , 动作设定（Pose Sheet） → 各种常见姿势, 服装设定（Costume Design）',
+      anime: '将这张图片变成新海诚风格, 日式赛璐珞的图片'
     }
     
     return stylePrompts[style] || stylePrompts.figurine
@@ -308,6 +309,99 @@ export function apply(ctx: Context, config: any) {
       return processImage(session, img, 'character_design', options?.num)
     })
   
+  // 二次元风格命令
+  ctx.command('二次元 [img:text]', '转换为新海诚风格')
+    .option('num', '-n <num:number> 生成图片数量 (1-4)')
+    .action(async ({ session, options }, img) => {
+      if (!session?.userId) return '会话无效'
+      return processImage(session, img, 'anime', options?.num)
+    })
+  
+  // 生成图像命令（自定义prompt）
+  ctx.command('生成图像', '使用自定义prompt进行图像处理')
+    .option('num', '-n <num:number> 生成图片数量 (1-4)')
+    .action(async ({ session, options }) => {
+      if (!session?.userId) return '会话无效'
+      
+      const userId = session.userId
+      
+      // 检查是否已有任务进行
+      if (activeTasks.has(userId)) {
+        return '您有一个图像处理任务正在进行中，请等待完成'
+      }
+      
+      // 等待用户发送图片和prompt
+      await session.send('请发送图片和prompt，格式：\n[图片] + 你的prompt描述\n\n例如：\n[图片] 让这张图片变成油画风格')
+      
+      const msg = await session.prompt(60000) // 60秒超时
+      if (!msg) {
+        return '等待超时，请重试'
+      }
+      
+      // 解析消息内容
+      const elements = h.parse(msg)
+      const images = h.select(elements, 'img')
+      const textElements = h.select(elements, 'text')
+      
+      // 检查是否有图片
+      if (images.length === 0) {
+        return '未检测到图片，请重新发送包含图片的消息'
+      }
+      
+      // 提取prompt文本
+      const prompt = textElements.map(el => el.attrs.content).join(' ').trim()
+      if (!prompt) {
+        return '未检测到prompt描述，请重新发送包含图片和文字描述的消息'
+      }
+      
+      const imageUrl = images[0].attrs.src
+      const imageCount = options?.num || config.defaultNumImages
+      
+      // 验证参数
+      if (imageCount < 1 || imageCount > 4) {
+        return '生成数量必须在 1-4 之间'
+      }
+      
+      logger.info('开始自定义图像处理', { 
+        userId, 
+        imageUrl, 
+        prompt, 
+        numImages: imageCount 
+      })
+      
+      // 调用图像编辑API
+      await session.send(`开始处理图片（自定义prompt）...\nPrompt: ${prompt}`)
+      
+      try {
+        const taskResponse = await callImageEditAPI(prompt, imageUrl, imageCount)
+        activeTasks.set(userId, taskResponse.request_id)
+        
+        await session.send(
+          `图像处理任务已提交！\nPrompt: ${prompt}\n任务ID: ${taskResponse.request_id}\n队列位置: ${taskResponse.queue_position}`
+        )
+        
+        // 开始轮询任务状态
+        const channelId = session.channelId
+        if (!channelId) {
+          activeTasks.delete(userId)
+          return '无法获取频道信息'
+        }
+        
+        pollImageEditStatus(
+          taskResponse.request_id, 
+          userId, 
+          session.bot, 
+          channelId
+        ).finally(() => {
+          activeTasks.delete(userId)
+        })
+        
+      } catch (error) {
+        activeTasks.delete(userId)
+        logger.error('自定义图像处理失败', { userId, error })
+        return '图像处理失败，请重试'
+      }
+    })
 
   // 任务状态查询命令
   ctx.command('图像处理.状态', '查询当前图像处理任务状态')
