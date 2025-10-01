@@ -83,6 +83,21 @@ export function apply(ctx: Context, config: Config) {
   const activeTasks: Map<string, TaskInfo> = new Map()
   const waitingImages: Map<string, WaitingImage> = new Map()
 
+  logger.info('========================================')
+  logger.info('手办化模块: 开始初始化插件')
+  logger.info('手办化模块: 配置信息', {
+    hasApiKey: !!config.apiKey,
+    apiKeyLength: config.apiKey?.length || 0,
+    cooldownTime: config.cooldownTime,
+    apiTimeout: config.apiTimeout,
+    pollInterval: config.pollInterval,
+    maxPollAttempts: config.maxPollAttempts,
+    enableLog: config.enableLog,
+    maxImageSize: config.maxImageSize,
+    defaultStyle: config.defaultStyle,
+    presetsCount: config.figurinePresets?.length || 0
+  })
+
   // 验证API密钥配置
   if (!config.apiKey || config.apiKey.trim() === '') {
     logger.error('云雾文生图模块: API密钥未配置或为空')
@@ -488,11 +503,22 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 手办化命令
-  ctx.command('手办化', '通过图片生成手办化效果')
-    .option('style', '-s <style:number>', { fallback: config.defaultStyle })
-    .action(async (argv) => {
+  logInfo('手办化模块: 开始注册"手办化"命令', { defaultStyle: config.defaultStyle })
+  
+  const shoubanhauCmd = ctx.command('手办化', '通过图片生成手办化效果')
+  logInfo('手办化模块: "手办化"命令对象已创建')
+  
+  try {
+    shoubanhauCmd.option('style', '--style <style:number>', { fallback: config.defaultStyle })
+    logInfo('手办化模块: 成功添加 --style 选项', { fallback: config.defaultStyle })
+  } catch (error: any) {
+    logError('手办化模块: 添加 --style 选项失败', { error: error?.message, stack: error?.stack })
+    throw error
+  }
+  
+  shoubanhauCmd.action(async (argv) => {
       const userId = argv.session?.userId
-      const style = Number(argv.options?.style) || config.defaultStyle
+      const style = Number((argv.options as any)?.style) || config.defaultStyle
       
       // 验证风格参数
       if (style < 1 || style > config.figurinePresets.length) {
@@ -533,12 +559,23 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 文生图命令（保留作为备用）
-  ctx.command('文生图', '使用AI生成图片')
-    .option('num', '-n <num:number>', { fallback: 1 })
-    .action(async (argv) => {
+  logInfo('手办化模块: 开始注册"文生图"命令')
+  
+  const wenshengtuCmd = ctx.command('文生图', '使用AI生成图片')
+  logInfo('手办化模块: "文生图"命令对象已创建')
+  
+  try {
+    wenshengtuCmd.option('num', '-n <num:number>', { fallback: 1 })
+    logInfo('手办化模块: 成功添加 -n 选项', { fallback: 1 })
+  } catch (error: any) {
+    logError('手办化模块: 添加 -n 选项失败', { error: error?.message, stack: error?.stack })
+    throw error
+  }
+  
+  wenshengtuCmd.action(async (argv) => {
       const userId = argv.session?.userId
       const prompt = argv.session?.content?.trim()
-      const numImages = Number(argv.options?.num) || 1
+      const numImages = Number((argv.options as any)?.num) || 1
       
       // 验证提示词
       if (!prompt || prompt.length < 2) {
@@ -603,6 +640,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 重置状态命令
+  logInfo('手办化模块: 开始注册"手办化重置"命令')
   ctx.command('手办化重置', '重置手办化处理状态')
     .action(async (argv) => {
       const userId = argv.session?.userId
@@ -633,6 +671,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 查询任务状态命令
+  logInfo('手办化模块: 开始注册"手办化状态"命令')
   ctx.command('手办化状态', '查询当前用户的手办化任务状态')
     .action(async (argv) => {
       const userId = argv.session?.userId
@@ -665,6 +704,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 文生图状态命令（保留作为备用）
+  logInfo('手办化模块: 开始注册"文生图状态"命令')
   ctx.command('文生图状态', '查询当前用户的文生图任务状态')
     .action(async (argv) => {
       const userId = argv.session?.userId
@@ -689,7 +729,11 @@ export function apply(ctx: Context, config: Config) {
       return statusMessage
     })
 
+  logInfo('手办化模块: 所有命令注册完成')
+  logInfo('手办化模块: 已注册的命令: 手办化, 文生图, 手办化重置, 手办化状态, 文生图状态')
+
   // 监听消息事件，处理等待中的图片
+  logInfo('手办化模块: 开始注册消息监听器')
   ctx.on('message', async (session) => {
     if (session.userId && waitingImages.has(session.userId)) {
       const images = extractImages(session)
@@ -711,15 +755,30 @@ export function apply(ctx: Context, config: Config) {
   })
 
   // 插件卸载时清理资源
+  logInfo('手办化模块: 注册 dispose 事件监听器')
   ctx.on('dispose', () => {
+    logInfo('手办化模块: 开始卸载插件')
+    
     // 清理所有等待中的超时器
+    const waitingCount = waitingImages.size
     for (const [userId, { timeout }] of waitingImages) {
       clearTimeout(timeout)
     }
     waitingImages.clear()
+    
     // 清理处理状态
+    const processingCount = processingUsers.size
+    const tasksCount = activeTasks.size
     processingUsers.clear()
     activeTasks.clear()
-    logInfo('手办化模块: 插件已卸载，资源已清理')
+    
+    logInfo('手办化模块: 插件已卸载，资源已清理', {
+      waitingCount,
+      processingCount,
+      tasksCount
+    })
   })
+
+  logInfo('手办化模块: 插件初始化完成！')
+  logInfo('========================================')
 }
