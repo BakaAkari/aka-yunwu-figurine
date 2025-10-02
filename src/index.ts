@@ -81,14 +81,17 @@ export function apply(ctx: Context, config: any) {
   }
 
   // 调用图像编辑API
-  async function callImageEditAPI(prompt: string, imageUrl: string, numImages: number = 1) {
+  async function callImageEditAPI(prompt: string, imageUrls: string | string[], numImages: number = 1) {
+    // 支持单张图片或多张图片
+    const urls = Array.isArray(imageUrls) ? imageUrls : [imageUrls]
+    
     const requestData = {
       prompt,
-      image_urls: [imageUrl],  // ⚠️ 注意：必须是数组，即使只有一张图片
+      image_urls: urls,  // ⚠️ 注意：必须是数组，支持多张图片
       num_images: numImages
     }
     
-    logger.debug('调用图像编辑API', { prompt, imageUrls: [imageUrl], numImages })
+    logger.debug('调用图像编辑API', { prompt, imageUrls: urls, numImages })
     
     try {
       const response = await ctx.http.post(
@@ -198,7 +201,17 @@ export function apply(ctx: Context, config: any) {
     } catch (error) {
       activeTasks.delete(userId)
       logger.error('图像处理失败', { userId, error })
-      return '图像处理失败，请重试'
+      
+      // 尝试提取API返回的错误信息
+      let errorMessage = '图像处理失败，请重试'
+      if (error && typeof error === 'object' && 'response' in error) {
+        const response = (error as any).response
+        if (response && response.data && response.data.message) {
+          errorMessage = `图像处理失败：${response.data.message}`
+        }
+      }
+      
+      return errorMessage
     }
   }
 
@@ -399,7 +412,115 @@ export function apply(ctx: Context, config: any) {
       } catch (error) {
         activeTasks.delete(userId)
         logger.error('自定义图像处理失败', { userId, error })
-        return '图像处理失败，请重试'
+        
+        // 尝试提取API返回的错误信息
+        let errorMessage = '图像处理失败，请重试'
+        if (error && typeof error === 'object' && 'response' in error) {
+          const response = (error as any).response
+          if (response && response.data && response.data.message) {
+            errorMessage = `图像处理失败：${response.data.message}`
+          }
+        }
+        
+        return errorMessage
+      }
+    })
+
+  // 合并命令（多张图片合并）
+  ctx.command('合并', '合并多张图片，使用自定义prompt控制合并效果')
+    .option('num', '-n <num:number> 生成图片数量 (1-4)')
+    .action(async ({ session, options }) => {
+      if (!session?.userId) return '会话无效'
+      
+      const userId = session.userId
+      
+      // 检查是否已有任务进行
+      if (activeTasks.has(userId)) {
+        return '您有一个图像处理任务正在进行中，请等待完成'
+      }
+      
+      // 等待用户发送多张图片和prompt
+      await session.send('请发送多张图片和prompt，格式：\n[图片1] [图片2] [图片3]... + 你的prompt描述\n\n例如：\n[图片1] [图片2] 将这两张图片合并成一张，第一张作为背景，第二张作为前景')
+      
+      const msg = await session.prompt(60000) // 60秒超时
+      if (!msg) {
+        return '等待超时，请重试'
+      }
+      
+      // 解析消息内容
+      const elements = h.parse(msg)
+      const images = h.select(elements, 'img')
+      const textElements = h.select(elements, 'text')
+      
+      // 检查是否有至少两张图片
+      if (images.length < 2) {
+        return '需要至少两张图片进行合并，请重新发送包含多张图片的消息'
+      }
+      
+      // 提取prompt文本
+      const prompt = textElements.map(el => el.attrs.content).join(' ').trim()
+      if (!prompt) {
+        return '未检测到prompt描述，请重新发送包含图片和文字描述的消息'
+      }
+      
+      // 提取所有图片URL
+      const imageUrls = images.map(img => img.attrs.src)
+      const imageCount = options?.num || config.defaultNumImages
+      
+      // 验证参数
+      if (imageCount < 1 || imageCount > 4) {
+        return '生成数量必须在 1-4 之间'
+      }
+      
+      logger.info('开始图片合并处理', { 
+        userId, 
+        imageUrls, 
+        prompt, 
+        numImages: imageCount,
+        imageCount: images.length
+      })
+      
+      // 调用图像编辑API（支持多张图片）
+      await session.send(`开始合并图片（${images.length}张）...\nPrompt: ${prompt}`)
+      
+      try {
+        const taskResponse = await callImageEditAPI(prompt, imageUrls, imageCount)
+        activeTasks.set(userId, taskResponse.request_id)
+        
+        await session.send(
+          `图片合并任务已提交！\nPrompt: ${prompt}\n图片数量: ${images.length}\n任务ID: ${taskResponse.request_id}\n队列位置: ${taskResponse.queue_position}`
+        )
+        
+        // 开始轮询任务状态
+        const channelId = session.channelId
+        if (!channelId) {
+          activeTasks.delete(userId)
+          return '无法获取频道信息'
+        }
+        
+        pollImageEditStatus(
+          taskResponse.request_id, 
+          userId, 
+          session.bot, 
+          channelId
+        ).finally(() => {
+          activeTasks.delete(userId)
+        })
+        
+      } catch (error) {
+        activeTasks.delete(userId)
+        logger.error('图片合并失败', { userId, error })
+        
+        // 尝试提取API返回的错误信息
+        let errorMessage = '图片合并失败，请重试'
+        if (error && typeof error === 'object' && 'response' in error) {
+          const response = (error as any).response
+          if (response && response.data && response.data.message) {
+            errorMessage = `图片合并失败：${response.data.message}`
+          }
+        }
+        
+        return errorMessage
       }
     })
 
