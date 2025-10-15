@@ -2,36 +2,73 @@ import { Context, Schema, h, Session } from 'koishi'
 
 export const name = 'aka-yunwu-figurine'
 
-export const Config = Schema.object({
-  apiKey: Schema.string().description('云雾API密钥').required(),
-  modelId: Schema.string().default('gemini-2.5-flash-image').description('图像生成模型ID'),
-  apiTimeout: Schema.number().default(120).description('API请求超时时间（秒）'),
-  commandTimeout: Schema.number().default(180).description('命令执行总超时时间（秒）'),
+export interface StyleConfig {
+  commandName: string
+  commandDescription: string
+  prompt: string
+  enabled: boolean
+}
+
+export const Config = Schema.intersect([
+  Schema.object({
+    apiKey: Schema.string().description('云雾API密钥').required(),
+    modelId: Schema.string().default('gemini-2.5-flash-image').description('图像生成模型ID'),
+    apiTimeout: Schema.number().default(120).description('API请求超时时间（秒）'),
+    commandTimeout: Schema.number().default(180).description('命令执行总超时时间（秒）'),
+    
+    // 默认设置
+    defaultNumImages: Schema.number()
+      .default(1)
+      .min(1)
+      .max(4)
+      .description('默认生成图片数量')
+  }),
   
-  // 默认设置
-  defaultNumImages: Schema.number()
-    .default(1)
-    .min(1)
-    .max(4)
-    .description('默认生成图片数量')
-})
+  // 自定义风格命令配置
+  Schema.object({
+    styles: Schema.array(Schema.object({
+      commandName: Schema.string().required().description('命令名称（不含前缀斜杠）'),
+      commandDescription: Schema.string().required().description('命令描述'),
+      prompt: Schema.string().role('textarea', { rows: 4 }).required().description('生成 prompt'),
+      enabled: Schema.boolean().default(true).description('是否启用此命令')
+    })).role('table').default([
+      {
+        commandName: '变手办',
+        commandDescription: '转换为手办风格',
+        prompt: '将这张照片变成手办模型。在它后面放置一个印有图像主体的盒子，桌子上有一台电脑显示Blender建模过程。在盒子前面添加一个圆形塑料底座，角色手办站在上面。如果可能的话，将场景设置在室内',
+        enabled: true
+      },
+      {
+        commandName: '变真人',
+        commandDescription: '转换为真人风格',
+        prompt: '生成一个亚洲真人女孩cosplay这张插画的写实照片，照片背景设置在普通街道',
+        enabled: true
+      },
+      {
+        commandName: '角色设定',
+        commandDescription: '生成人物角色设定',
+        prompt: '为我生成人物的角色设定（Character Design）, 比例设定（不同身高对比、头身比等）, 三视图（正面、侧面、背面）, 表情设定（Expression Sheet） , 动作设定（Pose Sheet） → 各种常见姿势, 服装设定（Costume Design）',
+        enabled: true
+      },
+      {
+        commandName: '道具设定',
+        commandDescription: '生成游戏道具设定（武器、载具等）',
+        prompt: '为我生成游戏道具的完整设定（Prop/Item Design），包含以下内容：功能结构图（Functional Components）、状态变化展示（State Variations）、细节特写（Detail Close-ups）',
+        enabled: true
+      },
+      {
+        commandName: '二次元',
+        commandDescription: '转换为新海诚风格',
+        prompt: '将这张图片变成新海诚风格, 日式赛璐珞的图片',
+        enabled: true
+      }
+    ]).description('自定义风格命令配置')
+  })
+])
 
 export function apply(ctx: Context, config: any) {
   const logger = ctx.logger('aka-yunwu-figurine')
   const activeTasks = new Map<string, string>()  // userId -> requestId
-
-  // 获取风格提示词（硬编码，不依赖配置）
-  function getStylePrompt(style: string): string {
-    const stylePrompts: Record<string, string> = {
-      // 4个核心风格
-      figurine: '将这张照片变成手办模型。在它后面放置一个印有图像主体的盒子，桌子上有一台电脑显示Blender建模过程。在盒子前面添加一个圆形塑料底座，角色手办站在上面。如果可能的话，将场景设置在室内',
-      realistic: '生成一个真人女孩cosplay这张插画的写实照片，照片背景设置在普通街道',
-      character_design: '为我生成人物的角色设定（Character Design）, 比例设定（不同身高对比、头身比等）, 三视图（正面、侧面、背面）, 表情设定（Expression Sheet） , 动作设定（Pose Sheet） → 各种常见姿势, 服装设定（Costume Design）',
-      anime: '将这张图片变成新海诚风格, 日式赛璐珞的图片'
-    }
-    
-    return stylePrompts[style] || stylePrompts.figurine
-  }
 
   // 下载图片并转换为 Base64
   async function downloadImageAsBase64(url: string): Promise<{ data: string, mimeType: string }> {
@@ -213,9 +250,9 @@ export function apply(ctx: Context, config: any) {
   }
 
   // 带超时的通用图像处理函数
-  async function processImageWithTimeout(session: any, img: any, style: string, numImages?: number) {
+  async function processImageWithTimeout(session: any, img: any, prompt: string, styleName: string, numImages?: number) {
     return Promise.race([
-      processImage(session, img, style, numImages),
+      processImage(session, img, prompt, styleName, numImages),
       new Promise<string>((_, reject) => 
         setTimeout(() => reject(new Error('命令执行超时')), config.commandTimeout * 1000)
       )
@@ -228,7 +265,7 @@ export function apply(ctx: Context, config: any) {
   }
 
   // 通用图像处理函数
-  async function processImage(session: any, img: any, style: string, numImages?: number) {
+  async function processImage(session: any, img: any, prompt: string, styleName: string, numImages?: number) {
     const userId = session.userId
     
     // 检查是否已有任务进行
@@ -237,7 +274,6 @@ export function apply(ctx: Context, config: any) {
     }
     
     // 获取参数
-    const prompt = getStylePrompt(style)
     const imageCount = numImages || config.defaultNumImages
     
     // 验证参数
@@ -254,13 +290,13 @@ export function apply(ctx: Context, config: any) {
     logger.info('开始图像处理', { 
       userId, 
       imageUrl, 
-      style,
+      styleName,
       prompt, 
       numImages: imageCount 
     })
     
     // 调用图像编辑API
-    await session.send(`开始处理图片（${style}风格）...`)
+    await session.send(`开始处理图片（${styleName}）...`)
     
     try {
       activeTasks.set(userId, 'processing')
@@ -297,37 +333,21 @@ export function apply(ctx: Context, config: any) {
   }
 
 
-  // 变手办风格命令
-  ctx.command('变手办 [img:text]', '转换为手办风格')
-    .option('num', '-n <num:number> 生成图片数量 (1-4)')
-    .action(async ({ session, options }, img) => {
-      if (!session?.userId) return '会话无效'
-      return processImageWithTimeout(session, img, 'figurine', options?.num)
-    })
-  
-  // 变真人风格命令
-  ctx.command('变真人 [img:text]', '转换为真人风格')
-    .option('num', '-n <num:number> 生成图片数量 (1-4)')
-    .action(async ({ session, options }, img) => {
-      if (!session?.userId) return '会话无效'
-      return processImageWithTimeout(session, img, 'realistic', options?.num)
-    })
-  
-  // 角色设定风格命令
-  ctx.command('角色设定 [img:text]', '生成人物角色设定')
-    .option('num', '-n <num:number> 生成图片数量 (1-4)')
-    .action(async ({ session, options }, img) => {
-      if (!session?.userId) return '会话无效'
-      return processImageWithTimeout(session, img, 'character_design', options?.num)
-    })
-  
-  // 二次元风格命令
-  ctx.command('二次元 [img:text]', '转换为新海诚风格')
-    .option('num', '-n <num:number> 生成图片数量 (1-4)')
-    .action(async ({ session, options }, img) => {
-      if (!session?.userId) return '会话无效'
-      return processImageWithTimeout(session, img, 'anime', options?.num)
-    })
+  // 动态注册风格命令
+  if (config.styles && Array.isArray(config.styles)) {
+    for (const style of config.styles) {
+      if (style.enabled && style.commandName && style.prompt) {
+        ctx.command(`${style.commandName} [img:text]`, style.commandDescription || '图像风格转换')
+          .option('num', '-n <num:number> 生成图片数量 (1-4)')
+          .action(async ({ session, options }, img) => {
+            if (!session?.userId) return '会话无效'
+            return processImageWithTimeout(session, img, style.prompt, style.commandName, options?.num)
+          })
+        
+        logger.info(`已注册命令: ${style.commandName}`)
+      }
+    }
+  }
   
   // 生成图像命令（自定义prompt）
   ctx.command('生成图像', '使用自定义prompt进行图像处理')
