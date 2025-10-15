@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-aka-yunwu-figurine",
   "description": "使用云雾API进行多风格图像处理（变手办、变真人、角色设定、二次元）",
-  "version": "0.4.3",
+  "version": "0.5.1",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

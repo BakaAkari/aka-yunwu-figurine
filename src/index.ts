@@ -4,9 +4,9 @@ export const name = 'aka-yunwu-figurine'
 
 export const Config = Schema.object({
   apiKey: Schema.string().description('云雾API密钥').required(),
+  modelId: Schema.string().default('gemini-2.5-flash-image').description('图像生成模型ID'),
   apiTimeout: Schema.number().default(120).description('API请求超时时间（秒）'),
-  pollInterval: Schema.number().default(3).description('轮询间隔时间（秒）'),
-  maxPollAttempts: Schema.number().default(40).description('最大轮询次数'),
+  commandTimeout: Schema.number().default(180).description('命令执行总超时时间（秒）'),
   
   // 默认设置
   defaultNumImages: Schema.number()
@@ -31,6 +31,35 @@ export function apply(ctx: Context, config: any) {
     }
     
     return stylePrompts[style] || stylePrompts.figurine
+  }
+
+  // 下载图片并转换为 Base64
+  async function downloadImageAsBase64(url: string): Promise<{ data: string, mimeType: string }> {
+    try {
+      const response = await ctx.http.get(url, { 
+        responseType: 'arraybuffer',
+        timeout: config.apiTimeout * 1000
+      })
+      
+      const buffer = Buffer.from(response)
+      const base64 = buffer.toString('base64')
+      
+      // 检测 MIME 类型
+      let mimeType = 'image/jpeg'
+      if (url.toLowerCase().endsWith('.png')) {
+        mimeType = 'image/png'
+      } else if (url.toLowerCase().endsWith('.webp')) {
+        mimeType = 'image/webp'
+      } else if (url.toLowerCase().endsWith('.gif')) {
+        mimeType = 'image/gif'
+      }
+      
+      logger.debug('图片下载并转换为Base64', { url, mimeType, size: base64.length })
+      return { data: base64, mimeType }
+    } catch (error) {
+      logger.error('下载图片失败', { url, error })
+      throw new Error('下载图片失败，请检查图片链接是否有效')
+    }
   }
 
   // 获取图片URL（三种方式）
@@ -80,63 +109,122 @@ export function apply(ctx: Context, config: any) {
     return url
   }
 
-  // 调用图像编辑API
-  async function callImageEditAPI(prompt: string, imageUrls: string | string[], numImages: number = 1) {
-    // 支持单张图片或多张图片
+  // 调用 Gemini 图像编辑 API
+  async function callGeminiImageEdit(prompt: string, imageUrls: string | string[], numImages: number = 1) {
     const urls = Array.isArray(imageUrls) ? imageUrls : [imageUrls]
     
-    const requestData = {
-      prompt,
-      image_urls: urls,  // ⚠️ 注意：必须是数组，支持多张图片
-      num_images: numImages
+    logger.debug('开始下载图片并转换为Base64', { urls })
+    
+    // 下载所有图片并转换为 Base64
+    const imageParts = []
+    for (const url of urls) {
+      const { data, mimeType } = await downloadImageAsBase64(url)
+      imageParts.push({
+        inline_data: {
+          mime_type: mimeType,
+          data: data
+        }
+      })
     }
     
-    logger.debug('调用图像编辑API', { prompt, imageUrls: urls, numImages })
+    // 构建 Gemini API 请求体
+    const requestData = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            ...imageParts
+          ]
+        }
+      ],
+      generationConfig: {
+        responseModalities: ["IMAGE"]
+      }
+    }
+    
+    logger.debug('调用 Gemini 图像编辑 API', { prompt, imageCount: urls.length, numImages })
     
     try {
       const response = await ctx.http.post(
-        'https://yunwu.ai/fal-ai/nano-banana/edit',
+        `https://yunwu.ai/v1beta/models/${config.modelId}:generateContent`,
         requestData,
         {
           headers: {
-            'Authorization': `Bearer ${config.apiKey}`,
             'Content-Type': 'application/json'
+          },
+          params: {
+            key: config.apiKey
           },
           timeout: config.apiTimeout * 1000
         }
       )
       
-      logger.success('图像编辑API调用成功', { 
-        requestId: response.request_id,
-        status: response.status,
-        queuePosition: response.queue_position
-      })
-      
+      logger.success('Gemini 图像编辑 API 调用成功', { response })
       return response
-    } catch (error) {
-      logger.error('图像编辑API调用失败', error)
-      throw error
+    } catch (error: any) {
+      logger.error('Gemini 图像编辑 API 调用失败', { 
+        message: error?.message || '未知错误',
+        code: error?.code,
+        status: error?.response?.status
+      })
+      // 不要直接抛出原始错误，避免泄露API密钥
+      throw new Error('图像处理API调用失败')
     }
   }
 
-  // 获取任务结果
-  async function getTaskResult(requestId: string) {
+  // 解析 Gemini 响应，提取图片 URL
+  function parseGeminiResponse(response: any): string[] {
     try {
-      const response = await ctx.http.get(
-        `https://yunwu.ai/fal-ai/nano-banana/requests/${requestId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${config.apiKey}`,
-          },
-          timeout: config.apiTimeout * 1000
-        }
-      )
+      const images: string[] = []
       
-      return response
+      if (response.candidates && response.candidates.length > 0) {
+        for (const candidate of response.candidates) {
+          if (candidate.content && candidate.content.parts) {
+            for (const part of candidate.content.parts) {
+              // 检查是否有 inlineData（Base64 图片，驼峰命名）
+              if (part.inlineData && part.inlineData.data) {
+                const base64Data = part.inlineData.data
+                const mimeType = part.inlineData.mimeType || 'image/jpeg'
+                const dataUrl = `data:${mimeType};base64,${base64Data}`
+                images.push(dataUrl)
+              }
+              // 兼容下划线命名
+              else if (part.inline_data && part.inline_data.data) {
+                const base64Data = part.inline_data.data
+                const mimeType = part.inline_data.mime_type || 'image/jpeg'
+                const dataUrl = `data:${mimeType};base64,${base64Data}`
+                images.push(dataUrl)
+              }
+              // 检查是否有 fileData（文件引用）
+              else if (part.fileData && part.fileData.fileUri) {
+                images.push(part.fileData.fileUri)
+              }
+            }
+          }
+        }
+      }
+      
+      return images
     } catch (error) {
-      logger.error('查询任务结果失败', { requestId, error })
-      throw error
+      logger.error('解析 Gemini 响应失败', error)
+      return []
     }
+  }
+
+  // 带超时的通用图像处理函数
+  async function processImageWithTimeout(session: any, img: any, style: string, numImages?: number) {
+    return Promise.race([
+      processImage(session, img, style, numImages),
+      new Promise<string>((_, reject) => 
+        setTimeout(() => reject(new Error('命令执行超时')), config.commandTimeout * 1000)
+      )
+    ]).catch(error => {
+      const userId = session.userId
+      if (userId) activeTasks.delete(userId)
+      logger.error('图像处理超时或失败', { userId, error })
+      return error.message === '命令执行超时' ? '图像处理超时，请重试' : '图像处理失败，请稍后重试'
+    })
   }
 
   // 通用图像处理函数
@@ -175,135 +263,46 @@ export function apply(ctx: Context, config: any) {
     await session.send(`开始处理图片（${style}风格）...`)
     
     try {
-      const taskResponse = await callImageEditAPI(prompt, imageUrl, imageCount)
-      activeTasks.set(userId, taskResponse.request_id)
+      activeTasks.set(userId, 'processing')
       
-      await session.send(
-        `图像处理任务已提交！\n风格: ${style}\n任务ID: ${taskResponse.request_id}\n队列位置: ${taskResponse.queue_position}`
-      )
+      const response = await callGeminiImageEdit(prompt, imageUrl, imageCount)
+      const images = parseGeminiResponse(response)
       
-      // 开始轮询任务状态
-      const channelId = session.channelId
-      if (!channelId) {
+      if (images.length === 0) {
         activeTasks.delete(userId)
-        return '无法获取频道信息'
+        return '图像处理失败：未能生成图片'
       }
       
-      pollImageEditStatus(
-        taskResponse.request_id, 
-        userId, 
-        session.bot, 
-        channelId
-      ).finally(() => {
-        activeTasks.delete(userId)
-      })
+      await session.send('图像处理完成！')
+      
+      // 发送生成的图片
+      for (let i = 0; i < images.length; i++) {
+        await session.send(h.image(images[i]))
+        
+        // 多张图片添加延时
+        if (images.length > 1 && i < images.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
+      }
+      
+      activeTasks.delete(userId)
       
     } catch (error) {
       activeTasks.delete(userId)
       logger.error('图像处理失败', { userId, error })
       
-      // 尝试提取API返回的错误信息
-      let errorMessage = '图像处理失败，请重试'
-      if (error && typeof error === 'object' && 'response' in error) {
-        const response = (error as any).response
-        if (response && response.data && response.data.message) {
-          errorMessage = `图像处理失败：${response.data.message}`
-        }
-      }
-      
-      return errorMessage
+      // 不返回具体错误信息，避免泄露API密钥或其他敏感信息
+      return '图像处理失败，请稍后重试'
     }
   }
 
-  // 轮询图像编辑任务状态（使用bot主动发送）
-  async function pollImageEditStatus(
-    requestId: string, 
-    userId: string, 
-    bot: any, 
-    channelId: string
-  ) {
-    let attempts = 0
-    
-    logger.info('开始轮询图像编辑任务状态', { requestId, userId, channelId })
-    
-    while (attempts < config.maxPollAttempts) {
-      try {
-        logger.debug('轮询任务状态', { 
-          requestId, 
-          attempt: attempts + 1, 
-          maxAttempts: config.maxPollAttempts 
-        })
-        
-        const result = await getTaskResult(requestId)
-        
-        if (result.images && result.images.length > 0) {
-          // 任务完成
-          logger.success('图像编辑任务完成', { 
-            requestId, 
-            userId, 
-            imageCount: result.images.length,
-            images: result.images.map((img: any) => ({
-              url: img.url,
-              width: img.width,
-              height: img.height,
-              contentType: img.content_type
-            }))
-          })
-          
-          // 使用bot对象主动发送消息（推荐，避免session失效）
-          try {
-            await bot.sendMessage(channelId, '图像处理完成！')
-            
-            // 发送多张图片时添加延时，避免刷屏
-            for (let i = 0; i < result.images.length; i++) {
-              const img = result.images[i]
-              await bot.sendMessage(channelId, h.image(img.url))
-              
-              // 如果有多张图片，添加延时
-              if (result.images.length > 1 && i < result.images.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, 1000))
-              }
-            }
-          } catch (sendError) {
-            logger.error('发送结果消息失败', { requestId, userId, error: sendError })
-          }
-          
-          return
-        }
-        
-        // 继续等待
-        logger.debug('任务未完成，继续等待', { requestId, waitTime: config.pollInterval })
-        await new Promise(resolve => setTimeout(resolve, config.pollInterval * 1000))
-        attempts++
-        
-      } catch (error) {
-        logger.error('轮询任务失败', { requestId, attempt: attempts + 1, error })
-        await new Promise(resolve => setTimeout(resolve, config.pollInterval * 1000))
-        attempts++
-      }
-    }
-    
-    // 超时处理
-    logger.warn('图像编辑任务轮询超时', { 
-      requestId, 
-      userId, 
-      maxAttempts: config.maxPollAttempts 
-    })
-    
-    // 使用bot对象发送超时消息
-    try {
-      await bot.sendMessage(channelId, '图像处理超时，请重试')
-    } catch (error) {
-      logger.error('发送超时消息失败', { requestId, userId, error })
-    }
-  }
 
   // 变手办风格命令
   ctx.command('变手办 [img:text]', '转换为手办风格')
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }, img) => {
       if (!session?.userId) return '会话无效'
-      return processImage(session, img, 'figurine', options?.num)
+      return processImageWithTimeout(session, img, 'figurine', options?.num)
     })
   
   // 变真人风格命令
@@ -311,7 +310,7 @@ export function apply(ctx: Context, config: any) {
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }, img) => {
       if (!session?.userId) return '会话无效'
-      return processImage(session, img, 'realistic', options?.num)
+      return processImageWithTimeout(session, img, 'realistic', options?.num)
     })
   
   // 角色设定风格命令
@@ -319,7 +318,7 @@ export function apply(ctx: Context, config: any) {
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }, img) => {
       if (!session?.userId) return '会话无效'
-      return processImage(session, img, 'character_design', options?.num)
+      return processImageWithTimeout(session, img, 'character_design', options?.num)
     })
   
   // 二次元风格命令
@@ -327,7 +326,7 @@ export function apply(ctx: Context, config: any) {
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }, img) => {
       if (!session?.userId) return '会话无效'
-      return processImage(session, img, 'anime', options?.num)
+      return processImageWithTimeout(session, img, 'anime', options?.num)
     })
   
   // 生成图像命令（自定义prompt）
@@ -336,94 +335,132 @@ export function apply(ctx: Context, config: any) {
     .action(async ({ session, options }) => {
       if (!session?.userId) return '会话无效'
       
-      const userId = session.userId
-      
-      // 检查是否已有任务进行
-      if (activeTasks.has(userId)) {
-        return '您有一个图像处理任务正在进行中，请等待完成'
-      }
-      
-      // 等待用户发送图片和prompt
-      await session.send('请发送图片和prompt，格式：\n[图片] + 你的prompt描述\n\n例如：\n[图片] 让这张图片变成油画风格')
-      
-      const msg = await session.prompt(60000) // 60秒超时
-      if (!msg) {
-        return '等待超时，请重试'
-      }
-      
-      // 解析消息内容
-      const elements = h.parse(msg)
-      const images = h.select(elements, 'img')
-      const textElements = h.select(elements, 'text')
-      
-      // 检查是否有图片
-      if (images.length === 0) {
-        return '未检测到图片，请重新发送包含图片的消息'
-      }
-      
-      // 提取prompt文本
-      const prompt = textElements.map(el => el.attrs.content).join(' ').trim()
-      if (!prompt) {
-        return '未检测到prompt描述，请重新发送包含图片和文字描述的消息'
-      }
-      
-      const imageUrl = images[0].attrs.src
-      const imageCount = options?.num || config.defaultNumImages
-      
-      // 验证参数
-      if (imageCount < 1 || imageCount > 4) {
-        return '生成数量必须在 1-4 之间'
-      }
-      
-      logger.info('开始自定义图像处理', { 
-        userId, 
-        imageUrl, 
-        prompt, 
-        numImages: imageCount 
-      })
-      
-      // 调用图像编辑API
-      await session.send(`开始处理图片（自定义prompt）...\nPrompt: ${prompt}`)
-      
-      try {
-        const taskResponse = await callImageEditAPI(prompt, imageUrl, imageCount)
-        activeTasks.set(userId, taskResponse.request_id)
-        
-        await session.send(
-          `图像处理任务已提交！\nPrompt: ${prompt}\n任务ID: ${taskResponse.request_id}\n队列位置: ${taskResponse.queue_position}`
-        )
-        
-        // 开始轮询任务状态
-        const channelId = session.channelId
-        if (!channelId) {
-          activeTasks.delete(userId)
-          return '无法获取频道信息'
-        }
-        
-        pollImageEditStatus(
-          taskResponse.request_id, 
-          userId, 
-          session.bot, 
-          channelId
-        ).finally(() => {
-          activeTasks.delete(userId)
-        })
-        
-      } catch (error) {
-        activeTasks.delete(userId)
-        logger.error('自定义图像处理失败', { userId, error })
-        
-        // 尝试提取API返回的错误信息
-        let errorMessage = '图像处理失败，请重试'
-        if (error && typeof error === 'object' && 'response' in error) {
-          const response = (error as any).response
-          if (response && response.data && response.data.message) {
-            errorMessage = `图像处理失败：${response.data.message}`
+      return Promise.race([
+        (async () => {
+          const userId = session.userId
+          if (!userId) return '会话无效'
+          
+          // 检查是否已有任务进行
+          if (activeTasks.has(userId)) {
+            return '您有一个图像处理任务正在进行中，请等待完成'
           }
-        }
-        
-        return errorMessage
-      }
+          
+          // 等待用户发送图片和prompt
+          await session.send('请发送图片和prompt，支持两种方式：\n1. 同时发送：[图片] + prompt描述\n2. 分步发送：先发送图片，再发送prompt文字\n\n例如：[图片] 让这张图片变成油画风格')
+          
+          const collectedImages: string[] = []
+          let prompt = ''
+          
+          // 循环接收消息，直到收到纯文字消息作为 prompt
+          while (true) {
+            const msg = await session.prompt(60000) // 60秒超时
+            if (!msg) {
+              return '等待超时，请重试'
+            }
+            
+            const elements = h.parse(msg)
+            const images = h.select(elements, 'img')
+            const textElements = h.select(elements, 'text')
+            const text = textElements.map(el => el.attrs.content).join(' ').trim()
+            
+            // 如果有图片，收集图片
+            if (images.length > 0) {
+              for (const img of images) {
+                collectedImages.push(img.attrs.src)
+              }
+              
+              // 如果同时有文字，作为 prompt 并结束
+              if (text) {
+                prompt = text
+                break
+              }
+              
+              // 只有图片，继续等待
+              await session.send(`已收到 ${collectedImages.length} 张图片，请继续发送图片或发送 prompt 文字`)
+              continue
+            }
+            
+            // 如果只有文字
+            if (text) {
+              if (collectedImages.length === 0) {
+                return '未检测到图片，请先发送图片'
+              }
+              prompt = text
+              break
+            }
+            
+            // 既没有图片也没有文字
+            return '未检测到有效内容，请重新发送'
+          }
+          
+          // 验证
+          if (collectedImages.length === 0) {
+            return '未检测到图片，请重新发送'
+          }
+          
+          if (!prompt) {
+            return '未检测到prompt描述，请重新发送'
+          }
+          
+          const imageUrl = collectedImages[0]
+          const imageCount = options?.num || config.defaultNumImages
+          
+          // 验证参数
+          if (imageCount < 1 || imageCount > 4) {
+            return '生成数量必须在 1-4 之间'
+          }
+          
+          logger.info('开始自定义图像处理', { 
+            userId, 
+            imageUrl, 
+            prompt, 
+            numImages: imageCount 
+          })
+          
+          // 调用图像编辑API
+          await session.send(`开始处理图片（自定义prompt）...\nPrompt: ${prompt}`)
+          
+          try {
+            activeTasks.set(userId, 'processing')
+            
+            const response = await callGeminiImageEdit(prompt, imageUrl, imageCount)
+            const resultImages = parseGeminiResponse(response)
+            
+            if (resultImages.length === 0) {
+              activeTasks.delete(userId)
+              return '图像处理失败：未能生成图片'
+            }
+            
+            await session.send('图像处理完成！')
+            
+            // 发送生成的图片
+            for (let i = 0; i < resultImages.length; i++) {
+              await session.send(h.image(resultImages[i]))
+              
+              if (resultImages.length > 1 && i < resultImages.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 1000))
+              }
+            }
+            
+            activeTasks.delete(userId)
+            
+          } catch (error) {
+            activeTasks.delete(userId)
+            logger.error('自定义图像处理失败', { userId, error })
+            
+            // 不返回具体错误信息，避免泄露API密钥或其他敏感信息
+            return '图像处理失败，请稍后重试'
+          }
+        })(),
+        new Promise<string>((_, reject) => 
+          setTimeout(() => reject(new Error('命令执行超时')), config.commandTimeout * 1000)
+        )
+      ]).catch(error => {
+        const userId = session.userId
+        if (userId) activeTasks.delete(userId)
+        logger.error('自定义图像处理超时或失败', { userId, error })
+        return error.message === '命令执行超时' ? '图像处理超时，请重试' : '图像处理失败，请稍后重试'
+      })
     })
 
   // 合并命令（多张图片合并）
@@ -432,96 +469,132 @@ export function apply(ctx: Context, config: any) {
     .action(async ({ session, options }) => {
       if (!session?.userId) return '会话无效'
       
-      const userId = session.userId
-      
-      // 检查是否已有任务进行
-      if (activeTasks.has(userId)) {
-        return '您有一个图像处理任务正在进行中，请等待完成'
-      }
-      
-      // 等待用户发送多张图片和prompt
-      await session.send('请发送多张图片和prompt，格式：\n[图片1] [图片2] [图片3]... + 你的prompt描述\n\n例如：\n[图片1] [图片2] 将这两张图片合并成一张，第一张作为背景，第二张作为前景')
-      
-      const msg = await session.prompt(60000) // 60秒超时
-      if (!msg) {
-        return '等待超时，请重试'
-      }
-      
-      // 解析消息内容
-      const elements = h.parse(msg)
-      const images = h.select(elements, 'img')
-      const textElements = h.select(elements, 'text')
-      
-      // 检查是否有至少两张图片
-      if (images.length < 2) {
-        return '需要至少两张图片进行合并，请重新发送包含多张图片的消息'
-      }
-      
-      // 提取prompt文本
-      const prompt = textElements.map(el => el.attrs.content).join(' ').trim()
-      if (!prompt) {
-        return '未检测到prompt描述，请重新发送包含图片和文字描述的消息'
-      }
-      
-      // 提取所有图片URL
-      const imageUrls = images.map(img => img.attrs.src)
-      const imageCount = options?.num || config.defaultNumImages
-      
-      // 验证参数
-      if (imageCount < 1 || imageCount > 4) {
-        return '生成数量必须在 1-4 之间'
-      }
-      
-      logger.info('开始图片合并处理', { 
-        userId, 
-        imageUrls, 
-        prompt, 
-        numImages: imageCount,
-        imageCount: images.length
-      })
-      
-      // 调用图像编辑API（支持多张图片）
-      await session.send(`开始合并图片（${images.length}张）...\nPrompt: ${prompt}`)
-      
-      try {
-        const taskResponse = await callImageEditAPI(prompt, imageUrls, imageCount)
-        activeTasks.set(userId, taskResponse.request_id)
-        
-        await session.send(
-          `图片合并任务已提交！\nPrompt: ${prompt}\n图片数量: ${images.length}\n任务ID: ${taskResponse.request_id}\n队列位置: ${taskResponse.queue_position}`
-        )
-        
-        // 开始轮询任务状态
-        const channelId = session.channelId
-        if (!channelId) {
-          activeTasks.delete(userId)
-          return '无法获取频道信息'
-        }
-        
-        pollImageEditStatus(
-          taskResponse.request_id, 
-          userId, 
-          session.bot, 
-          channelId
-        ).finally(() => {
-          activeTasks.delete(userId)
-        })
-        
-      } catch (error) {
-        activeTasks.delete(userId)
-        logger.error('图片合并失败', { userId, error })
-        
-        // 尝试提取API返回的错误信息
-        let errorMessage = '图片合并失败，请重试'
-        if (error && typeof error === 'object' && 'response' in error) {
-          const response = (error as any).response
-          if (response && response.data && response.data.message) {
-            errorMessage = `图片合并失败：${response.data.message}`
+      return Promise.race([
+        (async () => {
+          const userId = session.userId
+          if (!userId) return '会话无效'
+          
+          // 检查是否已有任务进行
+          if (activeTasks.has(userId)) {
+            return '您有一个图像处理任务正在进行中，请等待完成'
           }
-        }
-        
-        return errorMessage
-      }
+          
+          // 等待用户发送多张图片和prompt
+          await session.send('请发送多张图片和prompt，支持两种方式：\n1. 同时发送：[图片1] [图片2]... + prompt描述\n2. 分步发送：先发送多张图片，再发送prompt文字\n\n例如：[图片1] [图片2] 将这两张图片合并成一张')
+          
+          const collectedImages: string[] = []
+          let prompt = ''
+          
+          // 循环接收消息，直到收到纯文字消息作为 prompt
+          while (true) {
+            const msg = await session.prompt(60000) // 60秒超时
+            if (!msg) {
+              return '等待超时，请重试'
+            }
+            
+            const elements = h.parse(msg)
+            const images = h.select(elements, 'img')
+            const textElements = h.select(elements, 'text')
+            const text = textElements.map(el => el.attrs.content).join(' ').trim()
+            
+            // 如果有图片，收集图片
+            if (images.length > 0) {
+              for (const img of images) {
+                collectedImages.push(img.attrs.src)
+              }
+              
+              // 如果同时有文字，作为 prompt 并结束
+              if (text) {
+                prompt = text
+                break
+              }
+              
+              // 只有图片，继续等待
+              await session.send(`已收到 ${collectedImages.length} 张图片，请继续发送图片或发送 prompt 文字`)
+              continue
+            }
+            
+            // 如果只有文字
+            if (text) {
+              if (collectedImages.length < 2) {
+                return `需要至少两张图片进行合并，当前只有 ${collectedImages.length} 张图片`
+              }
+              prompt = text
+              break
+            }
+            
+            // 既没有图片也没有文字
+            return '未检测到有效内容，请重新发送'
+          }
+          
+          // 验证
+          if (collectedImages.length < 2) {
+            return '需要至少两张图片进行合并，请重新发送'
+          }
+          
+          if (!prompt) {
+            return '未检测到prompt描述，请重新发送'
+          }
+          
+          const imageCount = options?.num || config.defaultNumImages
+          
+          // 验证参数
+          if (imageCount < 1 || imageCount > 4) {
+            return '生成数量必须在 1-4 之间'
+          }
+          
+          logger.info('开始图片合并处理', { 
+            userId, 
+            imageUrls: collectedImages, 
+            prompt, 
+            numImages: imageCount,
+            imageCount: collectedImages.length
+          })
+          
+          // 调用图像编辑API（支持多张图片）
+          await session.send(`开始合并图片（${collectedImages.length}张）...\nPrompt: ${prompt}`)
+          
+          try {
+            activeTasks.set(userId, 'processing')
+            
+            const response = await callGeminiImageEdit(prompt, collectedImages, imageCount)
+            const resultImages = parseGeminiResponse(response)
+            
+            if (resultImages.length === 0) {
+              activeTasks.delete(userId)
+              return '图片合并失败：未能生成图片'
+            }
+            
+            await session.send('图片合并完成！')
+            
+            // 发送生成的图片
+            for (let i = 0; i < resultImages.length; i++) {
+              await session.send(h.image(resultImages[i]))
+              
+              if (resultImages.length > 1 && i < resultImages.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 1000))
+              }
+            }
+            
+            activeTasks.delete(userId)
+            
+          } catch (error) {
+            activeTasks.delete(userId)
+            logger.error('图片合并失败', { userId, error })
+            
+            // 不返回具体错误信息，避免泄露API密钥或其他敏感信息
+            return '图片合并失败，请稍后重试'
+          }
+        })(),
+        new Promise<string>((_, reject) => 
+          setTimeout(() => reject(new Error('命令执行超时')), config.commandTimeout * 1000)
+        )
+      ]).catch(error => {
+        const userId = session.userId
+        if (userId) activeTasks.delete(userId)
+        logger.error('图片合并超时或失败', { userId, error })
+        return error.message === '命令执行超时' ? '图片合并超时，请重试' : '图片合并失败，请稍后重试'
+      })
     })
 
   // 任务状态查询命令
@@ -530,14 +603,14 @@ export function apply(ctx: Context, config: any) {
       if (!session?.userId) return '会话无效'
       
       const userId = session.userId
-      const taskId = activeTasks.get(userId)
+      const taskStatus = activeTasks.get(userId)
       
-      if (!taskId) {
+      if (!taskStatus) {
         return '当前没有图像处理任务'
       }
       
-      return `图像处理任务进行中...\n任务ID: ${taskId}`
+      return `图像处理任务进行中...`
     })
 
-  logger.info('云雾图像处理插件已启动')
+  logger.info('云雾图像处理插件已启动 (Gemini 2.5 Flash Image)')
 }
