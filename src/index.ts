@@ -3,6 +3,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, promises as fs } fr
 import { join } from 'path'
 
 export const name = 'aka-yunwu-figurine'
+const GPTGOD_DEFAULT_API_URL = 'https://api.gptgod.online/v1/chat/completions'
+
+export type ImageProvider = 'yunwu' | 'gptgod'
 
 export interface StyleConfig {
   commandName: string
@@ -33,8 +36,11 @@ export interface UsersData {
 
 // 插件配置接口
 export interface PluginConfig {
-  apiKey: string
-  modelId: string
+  provider: ImageProvider
+  yunwuApiKey: string
+  yunwuModelId: string
+  gptgodApiKey: string
+  gptgodModelId: string
   apiTimeout: number
   commandTimeout: number
   defaultNumImages: number
@@ -75,8 +81,16 @@ export interface RechargeHistory {
 
 export const Config = Schema.intersect([
   Schema.object({
-    apiKey: Schema.string().description('云雾API密钥').required(),
-    modelId: Schema.string().default('gemini-2.5-flash-image').description('图像生成模型ID'),
+    provider: Schema.union([
+      Schema.const('yunwu').description('云雾 Gemini 服务'),
+      Schema.const('gptgod').description('GPTGod 服务'),
+    ] as const)
+      .default('yunwu')
+      .description('图像生成供应商'),
+    yunwuApiKey: Schema.string().description('云雾API密钥').role('secret').required(),
+    yunwuModelId: Schema.string().default('gemini-2.5-flash-image').description('云雾图像生成模型ID'),
+    gptgodApiKey: Schema.string().description('GPTGod API 密钥').role('secret').default(''),
+    gptgodModelId: Schema.string().default('nano-banana').description('GPTGod 模型ID'),
     apiTimeout: Schema.number().default(120).description('API请求超时时间（秒）'),
     commandTimeout: Schema.number().default(180).description('命令执行总超时时间（秒）'),
     
@@ -176,7 +190,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     userCommands: [
       ...getStyleCommands(),
       { name: '生成图像', description: '使用自定义prompt进行图像处理' },
-      { name: '合成图片', description: '合成多张图片，使用自定义prompt控制合成效果' },
+      { name: '合成图像', description: '合成多张图片，使用自定义prompt控制合成效果' },
       { name: '图像状态', description: '查询当前图像处理任务状态' },
       { name: '图像管理员', description: '查询当前用户的管理员状态' },
       { name: '图像额度', description: '查询用户额度信息' }
@@ -505,7 +519,7 @@ export function apply(ctx: Context, config: PluginConfig) {
       if (images.length > 0) {
         // 检查是否有多张图片
         if (images.length > 1) {
-          await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令')
+          await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图像"命令')
           return null
         }
         url = images[0].attrs.src
@@ -534,7 +548,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     
     // 检查是否有多张图片
     if (images.length > 1) {
-      await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令')
+      await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图像"命令')
       return null
     }
     
@@ -543,8 +557,8 @@ export function apply(ctx: Context, config: PluginConfig) {
     return url
   }
 
-  // 调用 Gemini 图像编辑 API
-  async function callGeminiImageEdit(prompt: string, imageUrls: string | string[], numImages: number = 1) {
+  // 调用云雾 Gemini 图像编辑 API
+  async function callYunwuImageEdit(prompt: string, imageUrls: string | string[], numImages: number = 1) {
     const urls = Array.isArray(imageUrls) ? imageUrls : [imageUrls]
     
     logger.debug('开始下载图片并转换为Base64', { urls })
@@ -577,27 +591,27 @@ export function apply(ctx: Context, config: PluginConfig) {
       }
     }
     
-    logger.debug('调用 Gemini 图像编辑 API', { prompt, imageCount: urls.length, numImages })
+    logger.debug('调用云雾图像编辑 API', { prompt, imageCount: urls.length, numImages })
     
     try {
       const response = await ctx.http.post(
-        `https://yunwu.ai/v1beta/models/${config.modelId}:generateContent`,
+        `https://yunwu.ai/v1beta/models/${config.yunwuModelId}:generateContent`,
         requestData,
         {
           headers: {
             'Content-Type': 'application/json'
           },
           params: {
-            key: config.apiKey
+            key: config.yunwuApiKey
           },
           timeout: config.apiTimeout * 1000
         }
       )
       
-      logger.success('Gemini 图像编辑 API 调用成功', { response })
+      logger.success('云雾图像编辑 API 调用成功', { response })
       return response
     } catch (error: any) {
-      logger.error('Gemini 图像编辑 API 调用失败', { 
+      logger.error('云雾图像编辑 API 调用失败', { 
         message: error?.message || '未知错误',
         code: error?.code,
         status: error?.response?.status
@@ -607,8 +621,122 @@ export function apply(ctx: Context, config: PluginConfig) {
     }
   }
 
-  // 解析 Gemini 响应，提取图片 URL
-  function parseGeminiResponse(response: any): string[] {
+  // 调用 GPTGod 图像编辑 API
+  async function callGptGodImageEdit(prompt: string, imageUrls: string | string[], numImages: number = 1) {
+    const urls = Array.isArray(imageUrls) ? imageUrls : [imageUrls]
+
+    if (!config.gptgodApiKey) {
+      throw new Error('GPTGod 配置不完整，请检查 API Key')
+    }
+
+    logger.debug('调用 GPTGod 图像编辑 API', { prompt, imageCount: urls.length, numImages })
+
+    const contentParts: any[] = [
+      {
+        type: 'text',
+        text: `${prompt}\n请生成 ${numImages} 张图片。`
+      }
+    ]
+
+    for (const url of urls) {
+      const { data, mimeType } = await downloadImageAsBase64(url)
+      contentParts.push({
+        type: 'image_url',
+        image_url: {
+          url: `data:${mimeType};base64,${data}`
+        }
+      })
+    }
+
+    const requestData = {
+      model: config.gptgodModelId,
+      stream: false,
+      messages: [
+        {
+          role: 'user',
+          content: contentParts
+        }
+      ]
+    }
+
+    try {
+      const response = await ctx.http.post(
+        GPTGOD_DEFAULT_API_URL,
+        requestData,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${config.gptgodApiKey}`
+          },
+          timeout: config.apiTimeout * 1000
+        }
+      )
+      logger.success('GPTGod 图像编辑 API 调用成功')
+      return response
+    } catch (error: any) {
+      logger.error('GPTGod 图像编辑 API 调用失败', {
+        message: error?.message || '未知错误',
+        code: error?.code,
+        status: error?.response?.status,
+        data: error?.response?.data
+      })
+      throw new Error('图像处理API调用失败')
+    }
+  }
+
+  function parseGptGodResponse(response: any): string[] {
+    try {
+      const images: string[] = []
+      if (response?.choices?.length > 0) {
+        const firstChoice = response.choices[0]
+        const messageContent = firstChoice.message?.content
+        let contentText = ''
+
+        if (typeof messageContent === 'string') {
+          contentText = messageContent
+        } else if (Array.isArray(messageContent)) {
+          contentText = messageContent.map((part: any) => part?.text || '').join('\n')
+        } else if (messageContent?.text) {
+          contentText = messageContent.text
+        }
+
+        const mdImageRegex = /!\[.*?\]\((https?:\/\/[^\)]+)\)/g
+        let match
+        while ((match = mdImageRegex.exec(contentText)) !== null) {
+          images.push(match[1])
+        }
+
+        if (images.length === 0) {
+          const urlRegex = /(https?:\/\/[^\s"')]+\.(?:png|jpg|jpeg|webp|gif))/gi
+          let urlMatch
+          while ((urlMatch = urlRegex.exec(contentText)) !== null) {
+            images.push(urlMatch[1])
+          }
+        }
+
+        if (images.length === 0 && contentText.trim().startsWith('http')) {
+          images.push(contentText.trim())
+        }
+      }
+      return images
+    } catch (error) {
+      logger.error('解析 GPTGod 响应失败', error)
+      return []
+    }
+  }
+
+  async function requestProviderImages(prompt: string, imageUrls: string | string[], numImages: number): Promise<string[]> {
+    if (config.provider === 'gptgod') {
+      const response = await callGptGodImageEdit(prompt, imageUrls, numImages)
+      return parseGptGodResponse(response)
+    }
+
+    const response = await callYunwuImageEdit(prompt, imageUrls, numImages)
+    return parseYunwuResponse(response)
+  }
+
+  // 解析云雾响应，提取图片 URL
+  function parseYunwuResponse(response: any): string[] {
     try {
       const images: string[] = []
       
@@ -641,7 +769,7 @@ export function apply(ctx: Context, config: PluginConfig) {
       
       return images
     } catch (error) {
-      logger.error('解析 Gemini 响应失败', error)
+      logger.error('解析云雾响应失败', error)
       return []
     }
   }
@@ -698,8 +826,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     try {
       activeTasks.set(userId, 'processing')
       
-      const response = await callGeminiImageEdit(prompt, imageUrl, imageCount)
-      const images = parseGeminiResponse(response)
+      const images = await requestProviderImages(prompt, imageUrl, imageCount)
       
       if (images.length === 0) {
         activeTasks.delete(userId)
@@ -779,7 +906,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           }
           
           // 等待用户发送图片和prompt
-          await session.send('请发送一张图片和prompt，支持两种方式：\n1. 同时发送：[图片] + prompt描述\n2. 分步发送：先发送一张图片，再发送prompt文字\n\n例如：[图片] 让这张图片变成油画风格\n\n注意：本功能仅支持处理一张图片，多张图片请使用"合成图片"命令')
+          await session.send('请发送一张图片和prompt，支持两种方式：\n1. 同时发送：[图片] + prompt描述\n2. 分步发送：先发送一张图片，再发送prompt文字\n\n例如：[图片] 让这张图片变成油画风格\n\n注意：本功能仅支持处理一张图片，多张图片请使用"合成图像"命令')
           
           const collectedImages: string[] = []
           let prompt = ''
@@ -800,12 +927,12 @@ export function apply(ctx: Context, config: PluginConfig) {
             if (images.length > 0) {
               // 检查是否已经有图片
               if (collectedImages.length > 0) {
-                return '本功能仅支持处理一张图片，如需合成多张图片请使用"合成图片"命令'
+                return '本功能仅支持处理一张图片，如需合成多张图片请使用"合成图像"命令'
               }
               
               // 检查是否发送了多张图片
               if (images.length > 1) {
-                return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令'
+                return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图像"命令'
               }
               
               for (const img of images) {
@@ -842,7 +969,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           }
           
           if (collectedImages.length > 1) {
-            return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令'
+            return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图像"命令'
           }
           
           if (!prompt) {
@@ -870,8 +997,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           try {
             activeTasks.set(userId, 'processing')
             
-            const response = await callGeminiImageEdit(prompt, imageUrl, imageCount)
-            const resultImages = parseGeminiResponse(response)
+            const resultImages = await requestProviderImages(prompt, imageUrl, imageCount)
             
             if (resultImages.length === 0) {
               activeTasks.delete(userId)
@@ -913,8 +1039,8 @@ export function apply(ctx: Context, config: PluginConfig) {
       })
     })
 
-  // 合成图片命令（多张图片合成）
-  ctx.command('合成图片', '合成多张图片，使用自定义prompt控制合成效果')
+  // 合成图像命令（多张图片合成）
+  ctx.command('合成图像', '合成多张图片，使用自定义prompt控制合成效果')
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }) => {
       if (!session?.userId) return '会话无效'
@@ -1008,13 +1134,12 @@ export function apply(ctx: Context, config: PluginConfig) {
           })
           
           // 调用图像编辑API（支持多张图片）
-          await session.send(`开始合成图片（${collectedImages.length}张）...\nPrompt: ${prompt}`)
+          await session.send(`开始合成图像（${collectedImages.length}张）...\nPrompt: ${prompt}`)
           
           try {
             activeTasks.set(userId, 'processing')
             
-            const response = await callGeminiImageEdit(prompt, collectedImages, imageCount)
-            const resultImages = parseGeminiResponse(response)
+            const resultImages = await requestProviderImages(prompt, collectedImages, imageCount)
             
             if (resultImages.length === 0) {
               activeTasks.delete(userId)
@@ -1033,7 +1158,7 @@ export function apply(ctx: Context, config: PluginConfig) {
             }
             
             // 成功处理图片后记录使用统计
-            await recordUserUsage(session, '合成图片')
+            await recordUserUsage(session, '合成图像')
             
             activeTasks.delete(userId)
             
@@ -1411,5 +1536,6 @@ export function apply(ctx: Context, config: PluginConfig) {
       }
     })
 
-  logger.info('云雾图像处理插件已启动 (Gemini 2.5 Flash Image)')
+  const providerLabel = config.provider === 'gptgod' ? 'GPTGod' : '云雾 Gemini 2.5 Flash Image'
+  logger.info(`云雾图像处理插件已启动 (${providerLabel})`)
 }
