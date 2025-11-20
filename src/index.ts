@@ -176,7 +176,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     userCommands: [
       ...getStyleCommands(),
       { name: '生成图像', description: '使用自定义prompt进行图像处理' },
-      { name: '合并', description: '合并多张图片，使用自定义prompt控制合并效果' },
+      { name: '合成图片', description: '合成多张图片，使用自定义prompt控制合成效果' },
       { name: '图像状态', description: '查询当前图像处理任务状态' },
       { name: '图像管理员', description: '查询当前用户的管理员状态' },
       { name: '图像额度', description: '查询用户额度信息' }
@@ -503,6 +503,11 @@ export function apply(ctx: Context, config: PluginConfig) {
     if (elements) {
       const images = h.select(elements, 'img')
       if (images.length > 0) {
+        // 检查是否有多张图片
+        if (images.length > 1) {
+          await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令')
+          return null
+        }
         url = images[0].attrs.src
         logger.debug('从引用消息获取图片', { url })
         return url
@@ -524,6 +529,12 @@ export function apply(ctx: Context, config: PluginConfig) {
     
     if (images.length === 0) {
       await session.send('未检测到图片，请重试')
+      return null
+    }
+    
+    // 检查是否有多张图片
+    if (images.length > 1) {
+      await session.send('本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令')
       return null
     }
     
@@ -768,7 +779,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           }
           
           // 等待用户发送图片和prompt
-          await session.send('请发送图片和prompt，支持两种方式：\n1. 同时发送：[图片] + prompt描述\n2. 分步发送：先发送图片，再发送prompt文字\n\n例如：[图片] 让这张图片变成油画风格')
+          await session.send('请发送一张图片和prompt，支持两种方式：\n1. 同时发送：[图片] + prompt描述\n2. 分步发送：先发送一张图片，再发送prompt文字\n\n例如：[图片] 让这张图片变成油画风格\n\n注意：本功能仅支持处理一张图片，多张图片请使用"合成图片"命令')
           
           const collectedImages: string[] = []
           let prompt = ''
@@ -787,6 +798,16 @@ export function apply(ctx: Context, config: PluginConfig) {
             
             // 如果有图片，收集图片
             if (images.length > 0) {
+              // 检查是否已经有图片
+              if (collectedImages.length > 0) {
+                return '本功能仅支持处理一张图片，如需合成多张图片请使用"合成图片"命令'
+              }
+              
+              // 检查是否发送了多张图片
+              if (images.length > 1) {
+                return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令'
+              }
+              
               for (const img of images) {
                 collectedImages.push(img.attrs.src)
               }
@@ -798,7 +819,7 @@ export function apply(ctx: Context, config: PluginConfig) {
               }
               
               // 只有图片，继续等待
-              await session.send(`已收到 ${collectedImages.length} 张图片，请继续发送图片或发送 prompt 文字`)
+              await session.send('已收到图片，请发送 prompt 描述文字')
               continue
             }
             
@@ -818,6 +839,10 @@ export function apply(ctx: Context, config: PluginConfig) {
           // 验证
           if (collectedImages.length === 0) {
             return '未检测到图片，请重新发送'
+          }
+          
+          if (collectedImages.length > 1) {
+            return '本功能仅支持处理一张图片，检测到多张图片。如需合成多张图片请使用"合成图片"命令'
           }
           
           if (!prompt) {
@@ -888,8 +913,8 @@ export function apply(ctx: Context, config: PluginConfig) {
       })
     })
 
-  // 合并命令（多张图片合并）
-  ctx.command('合并', '合并多张图片，使用自定义prompt控制合并效果')
+  // 合成图片命令（多张图片合成）
+  ctx.command('合成图片', '合成多张图片，使用自定义prompt控制合成效果')
     .option('num', '-n <num:number> 生成图片数量 (1-4)')
     .action(async ({ session, options }) => {
       if (!session?.userId) return '会话无效'
@@ -911,7 +936,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           }
           
           // 等待用户发送多张图片和prompt
-          await session.send('请发送多张图片和prompt，支持两种方式：\n1. 同时发送：[图片1] [图片2]... + prompt描述\n2. 分步发送：先发送多张图片，再发送prompt文字\n\n例如：[图片1] [图片2] 将这两张图片合并成一张')
+          await session.send('请发送多张图片和prompt，支持两种方式：\n1. 同时发送：[图片1] [图片2]... + prompt描述\n2. 分步发送：先发送多张图片，再发送prompt文字\n\n例如：[图片1] [图片2] 将这两张图片合成一张')
           
           const collectedImages: string[] = []
           let prompt = ''
@@ -948,7 +973,7 @@ export function apply(ctx: Context, config: PluginConfig) {
             // 如果只有文字
             if (text) {
               if (collectedImages.length < 2) {
-                return `需要至少两张图片进行合并，当前只有 ${collectedImages.length} 张图片`
+                return `需要至少两张图片进行合成，当前只有 ${collectedImages.length} 张图片`
               }
               prompt = text
               break
@@ -960,7 +985,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           
           // 验证
           if (collectedImages.length < 2) {
-            return '需要至少两张图片进行合并，请重新发送'
+            return '需要至少两张图片进行合成，请重新发送'
           }
           
           if (!prompt) {
@@ -974,7 +999,7 @@ export function apply(ctx: Context, config: PluginConfig) {
             return '生成数量必须在 1-4 之间'
           }
           
-          logger.info('开始图片合并处理', { 
+          logger.info('开始图片合成处理', { 
             userId, 
             imageUrls: collectedImages, 
             prompt, 
@@ -983,7 +1008,7 @@ export function apply(ctx: Context, config: PluginConfig) {
           })
           
           // 调用图像编辑API（支持多张图片）
-          await session.send(`开始合并图片（${collectedImages.length}张）...\nPrompt: ${prompt}`)
+          await session.send(`开始合成图片（${collectedImages.length}张）...\nPrompt: ${prompt}`)
           
           try {
             activeTasks.set(userId, 'processing')
@@ -993,10 +1018,10 @@ export function apply(ctx: Context, config: PluginConfig) {
             
             if (resultImages.length === 0) {
               activeTasks.delete(userId)
-              return '图片合并失败：未能生成图片'
+              return '图片合成失败：未能生成图片'
             }
             
-            await session.send('图片合并完成！')
+            await session.send('图片合成完成！')
             
             // 发送生成的图片
             for (let i = 0; i < resultImages.length; i++) {
@@ -1008,16 +1033,16 @@ export function apply(ctx: Context, config: PluginConfig) {
             }
             
             // 成功处理图片后记录使用统计
-            await recordUserUsage(session, '合并')
+            await recordUserUsage(session, '合成图片')
             
             activeTasks.delete(userId)
             
           } catch (error) {
             activeTasks.delete(userId)
-            logger.error('图片合并失败', { userId, error })
+            logger.error('图片合成失败', { userId, error })
             
             // 不返回具体错误信息，避免泄露API密钥或其他敏感信息
-            return '图片合并失败，请稍后重试'
+            return '图片合成失败，请稍后重试'
           }
         })(),
         new Promise<string>((_, reject) => 
@@ -1026,8 +1051,8 @@ export function apply(ctx: Context, config: PluginConfig) {
       ]).catch(error => {
         const userId = session.userId
         if (userId) activeTasks.delete(userId)
-        logger.error('图片合并超时或失败', { userId, error })
-        return error.message === '命令执行超时' ? '图片合并超时，请重试' : '图片合并失败，请稍后重试'
+        logger.error('图片合成超时或失败', { userId, error })
+        return error.message === '命令执行超时' ? '图片合成超时，请重试' : '图片合成失败，请稍后重试'
       })
     })
 
